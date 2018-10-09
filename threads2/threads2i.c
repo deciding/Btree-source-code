@@ -2401,6 +2401,135 @@ FILE *in;
 #endif
 }
 
+int* shuffles;
+double* sum_prob;
+
+void shuffle(int *array, size_t n)
+{
+    if (n > 1)
+    {
+        size_t i;
+        for (i = 0; i < n - 1; i++)
+        {
+          size_t j = i + rand() / (RAND_MAX / (n - i) + 1);
+          int t = array[j];
+          array[j] = array[i];
+          array[i] = t;
+        }
+    }
+}
+
+void create_shuffles(int n, double alpha){
+	double c;
+	
+        for (int i = 1; i <= n; ++i) {
+            c = c + (1.0 / pow((double) i, alpha));
+        }
+        c = 1.0 / c;
+
+        double sum = 0;
+        sum_prob = new double[keys];
+        for (int i = 0 ; i < n; ++i) {
+            sum += c / pow((double)i + 1, alpha);
+            sum_prob[i] = sum;
+        }
+
+        shuffles = new int[keys];
+        for (int i = 0; i < keys; ++i) {
+            shuffles[i] = i;
+        }
+
+        shuffle(shuffles,n);
+}
+
+    int gen() {
+//        return rand() % n;
+        double z = rand() / (double) RAND_MAX;            // Uniform random number (0 < z < 1)
+
+        // Compute normalization constant on first call only
+
+
+        int l = 0, r = n - 1;
+        int m = 0;
+        while (l <= r) {
+            m = (l + r) >> 1;
+            if (sum_prob[m] < z) {
+                l = m + 1;
+            } else if (sum_prob[m] == z) {
+                l = m;
+                break;
+            } else {
+                r = m - 1;
+            }
+        }
+
+        // Assert that zipf_value is between 1 and N
+
+        return shuffles[l];
+    }
+
+#ifdef unix
+void *mixed_index_file (void *arg)
+#else
+uint __stdcall mixed_index_file (void *arg)
+#endif
+{
+int line = 0, found = 0, cnt = 0;
+uid next, page_no = LEAF_page;	// start on first page of leaves
+unsigned char key[256];
+ThreadArg *args = arg;
+int ch, len = 0, slot;
+BtPageSet set[1];
+time_t tod[1];
+BtKey ptr;
+BtDb *bt;
+FILE *in;
+
+int n=args->n;
+double write_rate=args->write_rate;
+int insertion_ops[n];
+memset(insertion_ops,0,n*sizeof(int));
+
+bt = bt_open (args->mgr);
+create_shuffles(n,0);
+for(int i=0;i<n;i++){
+	insertion_ops[i]=i;
+}
+shuffle(insertion_ops,n);
+
+for(int i=0;i<n;i++){
+	sprintf((char *)key, "%d", insertion_ops[i]);
+	if( bt_insertkey (bt, key, strlen(key), 0, i, *tod) )
+		exit(0);
+}
+
+time (tod);
+
+fprintf(stderr, "started indexing for %s\n", args->infile);
+for(int i =0,i<n;i++){
+	sprintf((char *)key, "%d", gen());
+	if(rand() / (double)RAND_MAX<write_rate)
+		if( bt_insertkey (bt, key, strlen(key), 0, i, *tod) )
+			exit(0);
+	else{
+		cnt++;
+		if( bt_findkey (bt, key, strlen(key)) )
+			found++;
+		else if( bt->err )
+			exit(0);
+	}
+}
+	
+fprintf(stderr, "finished %s for %d keys\n, %d search, %d found", args->infile, line, cnt, found);
+
+bt_close (bt);
+#ifdef unix
+	return NULL;
+#else
+	return 0;
+#endif
+}
+
 typedef struct timeval timer;
 
 int main (int argc, char **argv)
@@ -2482,6 +2611,110 @@ BtDb *bt;
 			fprintf(stderr, "Error creating thread %d\n", err);
 #else
 		threads[idx] = (HANDLE)_beginthreadex(NULL, 65536, index_file, args + idx, 0, NULL);
+#endif
+	}
+
+	// 	wait for termination
+
+#ifdef unix
+	for( idx = 0; idx < cnt; idx++ )
+		pthread_join (threads[idx], NULL);
+#else
+	WaitForMultipleObjects (cnt, threads, TRUE, INFINITE);
+
+	for( idx = 0; idx < cnt; idx++ )
+		CloseHandle(threads[idx]);
+
+#endif
+	elapsed = getCpuTime(0) - start;
+	fprintf(stderr, " real %dm%.3fs\n", (int)(elapsed/60), elapsed - (int)(elapsed/60)*60);
+	elapsed = getCpuTime(1);
+	fprintf(stderr, " user %dm%.3fs\n", (int)(elapsed/60), elapsed - (int)(elapsed/60)*60);
+	elapsed = getCpuTime(2);
+	fprintf(stderr, " sys  %dm%.3fs\n", (int)(elapsed/60), elapsed - (int)(elapsed/60)*60);
+
+	bt_mgrclose (mgr);
+}
+
+int main (int argc, char **argv)
+{
+int idx, cnt, len, slot, err;
+int segsize, bits = 16;
+double start, stop;
+#ifdef unix
+pthread_t *threads;
+#else
+HANDLE *threads;
+#endif
+ThreadArg *args;
+uint poolsize = 0;
+float elapsed;
+int num = 0;
+char key[1];
+BtMgr *mgr;
+BtKey ptr;
+BtDb *bt;
+
+	if( argc < 4 ) {
+		fprintf (stderr, "Usage: %s idx_file write_rate number_of_threads [page_bits mapped_segments seg_bits line_numbers]\n", argv[0]);
+		fprintf (stderr, "  where page_bits is the page size in bits\n");
+		fprintf (stderr, "  mapped_segments is the number of mmap segments in buffer pool\n");
+		fprintf (stderr, "  seg_bits is the size of individual segments in buffer pool in pages in bits\n");
+		fprintf (stderr, "  line_numbers = 1 to append line numbers to keys\n");
+		fprintf (stderr, "  src_file1 thru src_filen are files of keys separated by newline\n");
+		exit(0);
+	}
+
+	start = getCpuTime(0);
+
+	if( argc > 4 )
+		bits = atoi(argv[4]);
+
+	if( argc > 5 )
+		poolsize = atoi(argv[5]);
+
+	if( !poolsize )
+		fprintf (stderr, "Warning: no mapped_pool\n");
+
+	if( poolsize > 65535 )
+		fprintf (stderr, "Warning: mapped_pool > 65535 segments\n");
+
+	if( argc > 6 )
+		segsize = atoi(argv[6]);
+	else
+		segsize = 4; 	// 16 pages per mmap segment
+
+	if( argc > 7 )
+		num = atoi(argv[7]);
+
+	cnt = argv[3];
+#ifdef unix
+	threads = malloc (cnt * sizeof(pthread_t));
+#else
+	threads = GlobalAlloc (GMEM_FIXED|GMEM_ZEROINIT, cnt * sizeof(HANDLE));
+#endif
+	args = malloc (cnt * sizeof(ThreadArg));
+
+	mgr = bt_mgr ((argv[1]), BT_rw, bits, poolsize, segsize, poolsize / 8);
+
+	if( !mgr ) {
+		fprintf(stderr, "Index Open Error %s\n", argv[1]);
+		exit (1);
+	}
+
+	//	fire off threads
+
+	for( idx = 0; idx < cnt; idx++ ) {
+		args[idx].mgr = mgr;
+		args[idx].num = num;
+		args[idx].idx = idx;
+		args[idx].n=n;
+		args[idx].write_rate=argv[2];
+#ifdef unix
+		if( err = pthread_create (threads + idx, NULL, mixed_index_file, args + idx) )
+			fprintf(stderr, "Error creating thread %d\n", err);
+#else
+		threads[idx] = (HANDLE)_beginthreadex(NULL, 65536, mixed_index_file, args + idx, 0, NULL);
 #endif
 	}
 

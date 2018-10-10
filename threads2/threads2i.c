@@ -2230,6 +2230,9 @@ typedef struct {
 	char *infile;
 	BtMgr *mgr;
 	int num;
+	int n;
+	int* ops;
+	double write_rate;
 } ThreadArg;
 
 //  standalone program to index file of keys
@@ -2401,8 +2404,6 @@ FILE *in;
 #endif
 }
 
-int* shuffles;
-double* sum_prob;
 
 void shuffle(int *array, size_t n)
 {
@@ -2419,7 +2420,7 @@ void shuffle(int *array, size_t n)
     }
 }
 
-void create_shuffles(int n, double alpha){
+void create_shuffles(int* shuffles, double* sum_prob, int n, double alpha){
 	double c;
 	
         for (int i = 1; i <= n; ++i) {
@@ -2428,21 +2429,19 @@ void create_shuffles(int n, double alpha){
         c = 1.0 / c;
 
         double sum = 0;
-        sum_prob = new double[keys];
         for (int i = 0 ; i < n; ++i) {
             sum += c / pow((double)i + 1, alpha);
             sum_prob[i] = sum;
         }
 
-        shuffles = new int[keys];
-        for (int i = 0; i < keys; ++i) {
+        for (int i = 0; i < n; ++i) {
             shuffles[i] = i;
         }
 
         shuffle(shuffles,n);
 }
 
-    int gen() {
+    int gen(int* shuffles, double* sum_prob, int n) {
 //        return rand() % n;
         double z = rand() / (double) RAND_MAX;            // Uniform random number (0 < z < 1)
 
@@ -2474,7 +2473,7 @@ void *mixed_index_file (void *arg)
 uint __stdcall mixed_index_file (void *arg)
 #endif
 {
-int line = 0, found = 0, cnt = 0;
+int line = 0, found = 0, find_cnt = 0, write_cnt=0;
 uid next, page_no = LEAF_page;	// start on first page of leaves
 unsigned char key[256];
 ThreadArg *args = arg;
@@ -2486,33 +2485,22 @@ BtDb *bt;
 FILE *in;
 
 int n=args->n;
+int * ops=args->ops;
 double write_rate=args->write_rate;
-int insertion_ops[n];
-memset(insertion_ops,0,n*sizeof(int));
 
 bt = bt_open (args->mgr);
-create_shuffles(n,0);
-for(int i=0;i<n;i++){
-	insertion_ops[i]=i;
-}
-shuffle(insertion_ops,n);
-
-for(int i=0;i<n;i++){
-	sprintf((char *)key, "%d", insertion_ops[i]);
-	if( bt_insertkey (bt, key, strlen(key), 0, i, *tod) )
-		exit(0);
-}
-
 time (tod);
 
-fprintf(stderr, "started indexing for %s\n", args->infile);
-for(int i =0,i<n;i++){
-	sprintf((char *)key, "%d", gen());
-	if(rand() / (double)RAND_MAX<write_rate)
+fprintf(stderr, "started indexing for %d records\n", n);
+for(int i =0;i<n;i++){
+	sprintf((char *)key, "%d", ops[i]);
+	if(rand() / (double)RAND_MAX<write_rate){
+		write_cnt++;
 		if( bt_insertkey (bt, key, strlen(key), 0, i, *tod) )
 			exit(0);
+	}
 	else{
-		cnt++;
+		find_cnt++;
 		if( bt_findkey (bt, key, strlen(key)) )
 			found++;
 		else if( bt->err )
@@ -2520,7 +2508,7 @@ for(int i =0,i<n;i++){
 	}
 }
 	
-fprintf(stderr, "finished %s for %d keys\n, %d search, %d found", args->infile, line, cnt, found);
+fprintf(stderr, "finished %d records , %d search, %d found, %d write", n, find_cnt, found, write_cnt);
 
 bt_close (bt);
 #ifdef unix
@@ -2532,7 +2520,7 @@ bt_close (bt);
 
 typedef struct timeval timer;
 
-int main (int argc, char **argv)
+int main2 (int argc, char **argv)
 {
 int idx, cnt, len, slot, err;
 int segsize, bits = 16;
@@ -2655,8 +2643,8 @@ BtMgr *mgr;
 BtKey ptr;
 BtDb *bt;
 
-	if( argc < 4 ) {
-		fprintf (stderr, "Usage: %s idx_file write_rate number_of_threads [page_bits mapped_segments seg_bits line_numbers]\n", argv[0]);
+	if( argc < 5 ) {
+		fprintf (stderr, "Usage: %s idx_file ops write_rate number_of_threads [page_bits mapped_segments seg_bits line_numbers]\n", argv[0]);
 		fprintf (stderr, "  where page_bits is the page size in bits\n");
 		fprintf (stderr, "  mapped_segments is the number of mmap segments in buffer pool\n");
 		fprintf (stderr, "  seg_bits is the size of individual segments in buffer pool in pages in bits\n");
@@ -2667,11 +2655,11 @@ BtDb *bt;
 
 	start = getCpuTime(0);
 
-	if( argc > 4 )
-		bits = atoi(argv[4]);
-
 	if( argc > 5 )
-		poolsize = atoi(argv[5]);
+		bits = atoi(argv[5]);
+
+	if( argc > 6 )
+		poolsize = atoi(argv[6]);
 
 	if( !poolsize )
 		fprintf (stderr, "Warning: no mapped_pool\n");
@@ -2679,15 +2667,15 @@ BtDb *bt;
 	if( poolsize > 65535 )
 		fprintf (stderr, "Warning: mapped_pool > 65535 segments\n");
 
-	if( argc > 6 )
-		segsize = atoi(argv[6]);
+	if( argc > 7 )
+		segsize = atoi(argv[7]);
 	else
 		segsize = 4; 	// 16 pages per mmap segment
 
-	if( argc > 7 )
-		num = atoi(argv[7]);
+	if( argc > 8 )
+		num = atoi(argv[8]);
 
-	cnt = argv[3];
+	cnt = atoi(argv[4]);
 #ifdef unix
 	threads = malloc (cnt * sizeof(pthread_t));
 #else
@@ -2702,14 +2690,41 @@ BtDb *bt;
 		exit (1);
 	}
 
+	int ops_cnt=atoi(argv[2]);
+	int* shuffles;
+	double* sum_prob;
+	int ops_per_thread=ops_cnt/cnt;
+	int* insertion_ops;
+	char keystr[256];
+	bt = bt_open (mgr);
+	insertion_ops=(int*)malloc(ops_cnt*sizeof(int));
+	sum_prob=(double*)malloc(ops_cnt*sizeof(double));
+	shuffles=(int*)malloc(ops_cnt*sizeof(int));
+	time_t tod[1];
+	time(tod);
+
+	for(int i=0;i<ops_cnt;i++){
+		insertion_ops[i]=i;
+	}
+	shuffle(insertion_ops,ops_cnt);
+
+	for(int i=0;i<ops_cnt;i++){
+		sprintf((char *)keystr, "%d", insertion_ops[i]);
+		if( bt_insertkey (bt, keystr, strlen(keystr), 0, i, *tod) )
+			exit(0);
+	}
+	create_shuffles(shuffles,sum_prob,ops_cnt,0);
 	//	fire off threads
 
 	for( idx = 0; idx < cnt; idx++ ) {
 		args[idx].mgr = mgr;
 		args[idx].num = num;
 		args[idx].idx = idx;
-		args[idx].n=n;
-		args[idx].write_rate=argv[2];
+		args[idx].n = ops_per_thread;
+		args[idx].ops=(int*)malloc(ops_per_thread*sizeof(int));
+		args[idx].write_rate=atof(argv[3]);
+		for(int i=0;i<ops_per_thread;i++)
+			args[idx].ops[i]=gen(shuffles,sum_prob,ops_cnt);
 #ifdef unix
 		if( err = pthread_create (threads + idx, NULL, mixed_index_file, args + idx) )
 			fprintf(stderr, "Error creating thread %d\n", err);
